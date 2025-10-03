@@ -52,15 +52,11 @@ type Incident struct {
 func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 	source := "NCDOT"
 	sourceID := strconv.Itoa(incident.ID)
-	eventType := "Vehicle Crash"
-
-	// --- DEBUGGING STEP ---
-	// Log the raw timestamp string to see its actual format.
-	log.Printf("DEBUG: Raw StartTime string from NC DOT API for incident %d: '%s'", incident.ID, incident.StartTime)
+	// The eventType is now dynamic based on the incident from the API.
+	eventType := incident.IncidentType
 
 	parsedTime, err := time.Parse(time.RFC3339, incident.StartTime)
 	if err != nil {
-		// Make the warning more explicit when we have to fall back.
 		log.Printf("WARNING: Could not parse timestamp '%s' for incident %d. Using current time instead. Error: %v", incident.StartTime, incident.ID, err)
 		parsedTime = time.Now()
 	}
@@ -121,24 +117,23 @@ func main() {
 
 	var allIncidents []Incident
 	if err := json.Unmarshal(body, &allIncidents); err != nil {
-		// If the API returns a non-JSON error page, this will fail.
-		// Log the raw response for debugging.
 		log.Printf("DEBUG: Raw response from server was: %s", string(body))
 		log.Fatalf("Error unmarshalling JSON: %s\n", err)
 	}
 
 	log.Printf("Found %d total incidents from NC DOT.", len(allIncidents))
-	crashesSaved := 0
+	incidentsSaved := 0
 
 	for _, incident := range allIncidents {
-		if incident.IncidentType == "Vehicle Crash" {
+		// --- UPDATED: Now captures both Vehicle Crash and Disabled Vehicle ---
+		if incident.IncidentType == "Vehicle Crash" || incident.IncidentType == "Disabled Vehicle" {
 			if err := saveToUnifiedDB(db, incident); err != nil {
-				log.Printf("Error saving NC DOT crash ID %d: %v", incident.ID, err)
+				log.Printf("Error saving NC DOT incident ID %d: %v", incident.ID, err)
 			} else {
-				crashesSaved++
+				incidentsSaved++
 			}
 		}
 	}
 
-	log.Printf("Run complete. Processed and saved %d vehicle crashes to the unified table.", crashesSaved)
+	log.Printf("Run complete. Processed and saved %d relevant incidents to the unified table.", incidentsSaved)
 }
