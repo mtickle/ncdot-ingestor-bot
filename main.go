@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -33,38 +34,6 @@ type Incident struct {
 	Location          string  `json:"location"`
 	Reason            string  `json:"reason"`
 }
-
-// type Incident struct {
-// 	ID                    int     `json:"id"`
-// 	Latitude              float64 `json:"latitude"`
-// 	Longitude             float64 `json:"longitude"`
-// 	CommonName            string  `json:"commonName"`
-// 	Reason                string  `json:"reason"`
-// 	Condition             string  `json:"condition"`
-// 	IncidentType          string  `json:"incidentType"`
-// 	Severity              int     `json:"severity"`
-// 	Direction             string  `json:"direction"`
-// 	Location              string  `json:"location"`
-// 	CountyID              int     `json:"countyId"`
-// 	CountyName            string  `json:"countyName"`
-// 	City                  string  `json:"city"`
-// 	StartTime             string  `json:"start"`
-// 	EndTime               string  `json:"end"`
-// 	LastUpdate            string  `json:"lastUpdate"`
-// 	Road                  string  `json:"road"`
-// 	RouteID               int     `json:"routeId"`
-// 	LanesClosed           int     `json:"lanesClosed"`
-// 	LanesTotal            int     `json:"lanesTotal"`
-// 	Detour                string  `json:"detour"`
-// 	CrossStreetPrefix     string  `json:"crossStreetPrefix"`
-// 	CrossStreetNumber     int     `json:"crossStreetNumber"`
-// 	CrossStreetSuffix     string  `json:"crossStreetSuffix"`
-// 	CrossStreetCommonName string  `json:"crossStreetCommonName"`
-// 	Event                 string  `json:"event"`
-// 	CreatedFromConcurrent bool    `json:"createdFromConcurrent"`
-// 	MovableConstruction   string  `json:"movableConstruction"`
-// 	WorkZoneSpeedLimit    int     `json:"workZoneSpeedLimit"`
-// }
 
 // --- Structs for the National Weather Service (NWS) API ---
 type NWSPointsResponse struct {
@@ -146,13 +115,28 @@ func getWeatherForIncident(lat, lon float64) (*WeatherData, error) {
 // saveToUnifiedDB normalizes, enriches, and saves an incident to the unified table.
 func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 	source := "NCDOT"
-	//sourceID := strconv.Itoa(incident.ID)
 	sourceID := strconv.Itoa(incident.ID)
 	eventType := incident.EventType
 
-	parsedTime, err := time.Parse(time.RFC3339, incident.StartTime)
-	if err != nil {
-		log.Printf("WARNING: Could not parse timestamp '%s', using current time. Error: %v", incident.StartTime, err)
+	var parsedTime time.Time
+
+	// Use the int64 LastUpdated field provided by the v2 API
+	if incident.LastUpdated > 0 {
+		// DriveNC v2 timestamps are typically 13-digit Unix milliseconds
+		if incident.LastUpdated > 9999999999 {
+			parsedTime = time.UnixMilli(incident.LastUpdated)
+		} else {
+			// Fallback in case they switch to 10-digit seconds
+			parsedTime = time.Unix(incident.LastUpdated, 0)
+		}
+	} else if incident.StartDate > 0 {
+		if incident.StartDate > 9999999999 {
+			parsedTime = time.UnixMilli(incident.StartDate)
+		} else {
+			parsedTime = time.Unix(incident.StartDate, 0)
+		}
+	} else {
+		log.Printf("WARNING: No valid timestamp found for incident %d, using current time.", incident.ID)
 		parsedTime = time.Now()
 	}
 
@@ -254,7 +238,11 @@ func main() {
 	incidentsSaved := 0
 
 	for _, incident := range allIncidents {
-		if incident.EventType == "Vehicle Crash" || incident.EventType == "Disabled Vehicle" {
+		subType := strings.ToLower(incident.EventSubType)
+
+		// 1. All "accidentsAndIncidents"
+		// 2. All "closures" where the subtype includes "vehiclecrash"
+		if incident.EventType == "accidentsAndIncidents" || (incident.EventType == "closures" && strings.Contains(subType, "vehiclecrash")) {
 			if err := saveToUnifiedDB(db, incident); err != nil {
 				log.Printf("Error saving NC DOT incident ID %d: %v", incident.ID, err)
 			} else {
