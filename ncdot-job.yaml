@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ncdot-test
+  namespace: unity
+
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+
+      containers:
+      - name: ncdot
+        image: docker.io/library/ncdot-ingestor:latest
+        imagePullPolicy: Never
+
+        envFrom:
+        - secretRef:
+            name: ncdot-env

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
@@ -193,9 +192,6 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 }
 
 func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Println("Note: .env file not found")
-	}
 
 	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
 		os.Getenv("DATABASE_HOST"), os.Getenv("DATABASE_PORT"), os.Getenv("DATABASE_USERNAME"),

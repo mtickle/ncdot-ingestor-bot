@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ncdot-ingestor
+  namespace: unity
+
+spec:
+  schedule: "1-59/5 * * * *"
+
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+
+          containers:
+          - name: ncdot
+            image: docker.io/library/ncdot-ingestor:latest
+            imagePullPolicy: Never
+
+            envFrom:
+            - secretRef:
+                name: ncdot-env
