@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
@@ -52,6 +54,14 @@ type WeatherData struct {
 	WindSpeed     string `json:"windSpeed"`
 	ShortForecast string `json:"shortForecast"`
 	Icon          string `json:"icon"`
+}
+
+func sanitizeURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "invalid-url"
+	}
+	return u.Host + u.Path
 }
 
 // getWeatherForIncident fetches current weather conditions from the NWS API.
@@ -111,8 +121,8 @@ func getWeatherForIncident(lat, lon float64) (*WeatherData, error) {
 	return nil, fmt.Errorf("no weather periods returned from NWS")
 }
 
-// saveToUnifiedDB normalizes, enriches, and saves an incident to the unified table.
-func saveToUnifiedDB(db *sql.DB, incident Incident) error {
+// saveToUnifiedDB normalizes, enriches, and saves an incident to the unified table, returning true if newly inserted.
+func saveToUnifiedDB(db *sql.DB, incident Incident) (bool, error) {
 	source := "NCDOT"
 	sourceID := strconv.Itoa(incident.ID)
 	eventType := incident.EventType
@@ -135,14 +145,34 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 			parsedTime = time.Unix(incident.StartDate, 0)
 		}
 	} else {
-		log.Printf("WARNING: No valid timestamp found for incident %d, using current time.", incident.ID)
+		slog.Warn("timestamp_missing_fallback",
+			"incident_id", incident.ID,
+			"county", incident.County,
+			"roadway", incident.RoadwayName,
+		)
 		parsedTime = time.Now()
 	}
 
 	// --- ENRICHMENT STEP ---
+	weatherStart := time.Now()
 	weatherData, err := getWeatherForIncident(incident.Latitude, incident.Longitude)
 	if err != nil {
-		log.Printf("Warning: could not fetch weather for NC DOT incident %d: %v", incident.ID, err)
+		slog.Warn("nws_enrichment_failed",
+			"incident_id", incident.ID,
+			"county", incident.County,
+			"lat", incident.Latitude,
+			"lng", incident.Longitude,
+			"duration_ms", time.Since(weatherStart).Milliseconds(),
+			"error", err,
+		)
+	} else {
+		slog.Info("nws_enrichment_ok",
+			"incident_id", incident.ID,
+			"county", incident.County,
+			"temp_f", weatherData.Temperature,
+			"forecast", weatherData.ShortForecast,
+			"duration_ms", time.Since(weatherStart).Milliseconds(),
+		)
 	}
 
 	details := map[string]interface{}{
@@ -152,7 +182,7 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {
-		return fmt.Errorf("could not marshal unified details to JSON: %w", err)
+		return false, fmt.Errorf("could not marshal unified details to JSON: %w", err)
 	}
 
 	// --- PREPARE NEW COLUMN VALUES ---
@@ -168,8 +198,7 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 		weatherForecast.Valid = true
 	}
 
-	// NCDOT doesn't have "jurisdiction", so we omit that column.
-	// NCDOT uses "reason" as the problem detail.
+	// RETURNING (xmax = 0) distinguishes brand-new inserts (true) from conflict updates (false)
 	sqlStatement := `
 		INSERT INTO unified_incidents (
 			source, source_id, event_type, status, address, latitude, longitude, timestamp, details,
@@ -181,57 +210,101 @@ func saveToUnifiedDB(db *sql.DB, incident Incident) error {
 			problem_detail = EXCLUDED.problem_detail,
 			weather_temp = EXCLUDED.weather_temp,
 			weather_wind_speed = EXCLUDED.weather_wind_speed,
-			weather_forecast = EXCLUDED.weather_forecast;
+			weather_forecast = EXCLUDED.weather_forecast
+		RETURNING (xmax = 0) AS inserted;
 	`
 
-	_, err = db.Exec(sqlStatement,
+	var wasInserted bool
+	err = db.QueryRow(sqlStatement,
 		source, sourceID, eventType, incident.Location, incident.Latitude, incident.Longitude, parsedTime, detailsJSON,
 		incident.Reason, weatherTemp, weatherWind, weatherForecast,
-	)
-	return err
+	).Scan(&wasInserted)
+
+	return wasInserted, err
 }
 
 func main() {
+	cycleStart := time.Now()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	if err := godotenv.Load(); err != nil {
+		slog.Debug("dotenv_not_loaded", "reason", "using container/environment variables")
+	}
+
+	dbHost := os.Getenv("DATABASE_HOST")
+	dotURL := os.Getenv("DOT_URL")
+	if dotURL == "" {
+		slog.Error("missing_required_env", "var", "DOT_URL")
+		os.Exit(1)
+	}
+
+	slog.Info("ingest_cycle_started",
+		"service", "ncdot-ingestor-bot",
+		"db_host", dbHost,
+		"feed_endpoint", sanitizeURL(dotURL),
+	)
 
 	psqlInfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=require",
-		os.Getenv("DATABASE_HOST"), os.Getenv("DATABASE_PORT"), os.Getenv("DATABASE_USERNAME"),
+		dbHost, os.Getenv("DATABASE_PORT"), os.Getenv("DATABASE_USERNAME"),
 		os.Getenv("DATABASE_PASSWORD"), os.Getenv("DATABASE_NAME"))
 
 	db, err := sql.Open("postgres", psqlInfo)
 	if err != nil {
-		log.Fatalf("Error opening database: %s", err)
+		slog.Error("db_open_failed", "db_host", dbHost, "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
+	dbStart := time.Now()
 	if err := db.Ping(); err != nil {
-		log.Fatalf("Error connecting to database: %s", err)
+		slog.Error("db_ping_failed", "db_host", dbHost, "error", err)
+		os.Exit(1)
 	}
-	log.Println("Successfully connected to the database.")
+	slog.Info("db_connected", "db_host", dbHost, "latency_ms", time.Since(dbStart).Milliseconds())
 
-	dotURL := os.Getenv("DOT_URL")
-	if dotURL == "" {
-		log.Fatalln("Error: DOT_URL must be set in your environment or .env file.")
-	}
-
-	resp, err := http.Get(dotURL)
+	fetchStart := time.Now()
+	httpClient := &http.Client{Timeout: 20 * time.Second}
+	resp, err := httpClient.Get(dotURL)
 	if err != nil {
-		log.Fatalf("Error fetching data from NC DOT API: %s\n", err)
+		slog.Error("ncdot_fetch_failed", "endpoint", sanitizeURL(dotURL), "error", err)
+		os.Exit(1)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		slog.Error("ncdot_non_200_status", "status_code", resp.StatusCode, "status", resp.Status)
+		os.Exit(1)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatalf("Error reading response body: %s\n", err)
+		slog.Error("ncdot_body_read_failed", "error", err)
+		os.Exit(1)
 	}
 
 	var allIncidents []Incident
 	if err := json.Unmarshal(body, &allIncidents); err != nil {
-		log.Printf("DEBUG: Raw response from server was: %s", string(body))
-		log.Fatalf("Error unmarshalling JSON: %s\n", err)
+		slog.Error("ncdot_json_unmarshal_failed",
+			"payload_bytes", len(body),
+			"error", err,
+		)
+		os.Exit(1)
 	}
 
-	log.Printf("Found %d total incidents from NC DOT.", len(allIncidents))
-	incidentsSaved := 0
+	slog.Info("ncdot_feed_fetched",
+		"status_code", resp.StatusCode,
+		"payload_bytes", len(body),
+		"total_raw_incidents", len(allIncidents),
+		"fetch_duration_ms", time.Since(fetchStart).Milliseconds(),
+	)
+
+	insertedCount := 0
+	updatedCount := 0
+	skippedCount := 0
+	failedCount := 0
 
 	for _, incident := range allIncidents {
 		subType := strings.ToLower(incident.EventSubType)
@@ -239,13 +312,48 @@ func main() {
 		// 1. All "accidentsAndIncidents"
 		// 2. All "closures" where the subtype includes "vehiclecrash"
 		if incident.EventType == "accidentsAndIncidents" || (incident.EventType == "closures" && strings.Contains(subType, "vehiclecrash")) {
-			if err := saveToUnifiedDB(db, incident); err != nil {
-				log.Printf("Error saving NC DOT incident ID %d: %v", incident.ID, err)
-			} else {
-				incidentsSaved++
+			wasInserted, err := saveToUnifiedDB(db, incident)
+			if err != nil {
+				failedCount++
+				slog.Error("ncdot_incident_upsert_failed",
+					"incident_id", incident.ID,
+					"county", incident.County,
+					"roadway", incident.RoadwayName,
+					"event_type", incident.EventType,
+					"error", err,
+				)
+				continue
 			}
+
+			action := "updated"
+			if wasInserted {
+				insertedCount++
+				action = "inserted"
+			} else {
+				updatedCount++
+			}
+
+			slog.Info("ncdot_incident_synced",
+				"action", action,
+				"incident_id", incident.ID,
+				"county", incident.County,
+				"roadway", incident.RoadwayName,
+				"event_type", incident.EventType,
+				"sub_type", incident.EventSubType,
+				"severity", incident.Severity,
+			)
+		} else {
+			skippedCount++
 		}
 	}
 
-	log.Printf("Run complete. Processed and saved %d relevant incidents to the unified table.", incidentsSaved)
+	slog.Info("ingest_cycle_completed",
+		"service", "ncdot-ingestor-bot",
+		"raw_total", len(allIncidents),
+		"inserted", insertedCount,
+		"updated", updatedCount,
+		"filtered_out", skippedCount,
+		"failed", failedCount,
+		"total_duration_ms", time.Since(cycleStart).Milliseconds(),
+	)
 }
